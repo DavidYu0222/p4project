@@ -1,0 +1,65 @@
+{
+  "p4info": "build/filter.p4.p4info.txtpb",
+  "bmv2_json": "build/filter.json",
+  "table_entries": [
+    {
+      "table": "MyIngress.ipv4_lpm",
+      "default_action": true,
+      "action_name": "MyIngress.drop",
+      "action_params": {}
+    },
+    {
+      "table": "MyIngress.ipv4_lpm",
+      "match": {
+        "hdr.ipv4.dstAddr": [
+          "192.168.11.1",
+          32
+        ]
+      },
+      "action_name": "MyIngress.ipv4_forward",
+      "action_params": {
+        "dstAddr": "08:00:00:00:01:11",
+        "port": 1
+      }
+    },
+    {
+      "table": "MyIngress.ipv4_lpm",
+      "match": {
+        "hdr.ipv4.dstAddr": [
+          "192.168.11.2",
+          32
+        ]
+      },
+      "action_name": "MyIngress.ipv4_forward",
+      "action_params": {
+        "dstAddr": "08:00:00:00:01:22",
+        "port": 2
+      }
+    },
+    {
+      "table": "MyIngress.ipv4_lpm",
+      "match": {
+        "hdr.ipv4.dstAddr": [
+          "192.168.0.0",
+          16
+        ]
+      },
+      "action_name": "MyIngress.ipv4_forward",
+      "action_params": {
+        "dstAddr": "08:00:00:00:04:00",
+        "port": 3
+      }
+    },
+    {
+      "table": "MyEgress.filter_dscp_tag",
+      "match": {
+        "hdr.ipv4.diffserv": [
+          12,
+          8
+        ]
+      },
+      "action_name": "MyEgress.drop",
+      "action_params": {}
+    }
+  ]
+}

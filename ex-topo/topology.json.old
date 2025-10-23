@@ -68,11 +68,11 @@
         }
     },
     "switches": {
-        "s11": {},
-        "s12": {},
-        "s13": {},
-        "s21": {},
-        "s22": {}
+        "s11": {"runtime_json": "ex-topo/s11-runtime.json"},
+        "s12": {"runtime_json": "ex-topo/s12-runtime.json"},
+        "s13": {"runtime_json": "ex-topo/s13-runtime.json"},
+        "s21": {"runtime_json": "ex-topo/s21-runtime.json"},
+        "s22": {"runtime_json": "ex-topo/s22-runtime.json"}
     },
     "links": [
         [ "h11","s11-p1" ],

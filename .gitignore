@@ -12,6 +12,7 @@
 !*p4app.json
 !topology.json
 !*-runtime.json
+!*-config.json
 
 *.pcap
 
