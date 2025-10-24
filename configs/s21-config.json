@@ -18,7 +18,7 @@
       },
       "action_name": "MyIngress.ipv4_forward",
       "action_params": {
-        "dstAddr": "08:00:00:00:01:00",
+        "dstAddr": "08:00:00:00:11:00",
         "port": 1
       }
     },
@@ -32,7 +32,7 @@
       },
       "action_name": "MyIngress.ipv4_forward",
       "action_params": {
-        "dstAddr": "08:00:00:00:02:00",
+        "dstAddr": "08:00:00:00:12:00",
         "port": 2
       }
     },
@@ -46,34 +46,8 @@
       },
       "action_name": "MyIngress.ipv4_forward",
       "action_params": {
-        "dstAddr": "08:00:00:00:05:00",
+        "dstAddr": "08:00:00:00:22:00",
         "port": 3
-      }
-    },
-    {
-      "table": "MyEgress.set_dscp_tag",
-      "match": {
-        "hdr.ipv4.srcAddr": [
-          "192.168.11.0",
-          24
-        ]
-      },
-      "action_name": "MyEgress.modify_dscp",
-      "action_params": {
-        "dscp_value": 10
-      }
-    },
-    {
-      "table": "MyEgress.set_dscp_tag",
-      "match": {
-        "hdr.ipv4.srcAddr": [
-          "192.168.12.0",
-          24
-        ]
-      },
-      "action_name": "MyEgress.modify_dscp",
-      "action_params": {
-        "dscp_value": 11
       }
     }
   ]

@@ -5,13 +5,6 @@ generate_configs.py
 Generate per-switch JSON config files (configs/<sw>-config.json) based on the
 hard-coded rules that were previously embedded in the controller script.
 
-Files produced:
- - configs/s11-config.json
- - configs/s12-config.json
- - configs/s13-config.json
- - configs/s21-config.json
- - configs/s22-config.json
-
 Adjust the constants below if you want different p4info / bmv2 json paths.
 """
 import os
@@ -35,6 +28,7 @@ BASIC_BMV2_JSON = "build/basic.json"
 DSCP_A = 10   # Class A tag
 DSCP_B = 11   # Class B tag
 DSCP_C = 12   # Class C tag
+DSCP_D = 13   # Class D tag
 
 # conveniently describe each switch's entries (mirrors your controller logic)
 SWITCH_CONFIGS = {
@@ -45,8 +39,8 @@ SWITCH_CONFIGS = {
             { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.1", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:01:11", "port": 1 } },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.2", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:01:22", "port": 2 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:04:00", "port": 3 } }
-            { "table": "MyEgress.filter_dscp_tag", "match": { "hdr.ipv4.diffserv": [DSCP_C, 8] }, "action_name": "MyEgress.drop", "action_params": {} }
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:21:00", "port": 3 } }
+            # { "table": "MyEgress.filter_dscp_tag", "match": { "hdr.ipv4.diffserv": [DSCP_C, 8] }, "action_name": "MyEgress.drop", "action_params": {} }
         ]
     },
     "s12": {
@@ -56,7 +50,7 @@ SWITCH_CONFIGS = {
             { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.1", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:02:11", "port": 1 } },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.2", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:02:22", "port": 2 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:04:00", "port": 3 } }
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:21:00", "port": 3 } }
         ]
     },
     "s13": {
@@ -67,7 +61,18 @@ SWITCH_CONFIGS = {
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.1", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:03:11", "port": 1 } },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.2", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:03:22", "port": 2 } },
             { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.3", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:03:33", "port": 3 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:05:00", "port": 4 } }
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:22:00", "port": 4 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:23:00", "port": 5 } },
+        ]
+    },
+    "s14": {
+        "p4info": FILTER_P4INFO_FILE,
+        "bmv2_json": FILTER_BMV2_JSON,
+        "table_entries": [
+            { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.1", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:04:11", "port": 1 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.2", 32] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:04:22", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:24:00", "port": 3 } }
         ]
     },
     "s21": {
@@ -75,11 +80,11 @@ SWITCH_CONFIGS = {
         "bmv2_json": TAG_BMV2_JSON,
         "table_entries": [
             { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:01:00", "port": 1 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:02:00", "port": 2 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:05:00", "port": 3 } },
-            { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.11.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_A } },
-            { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.12.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_B } }
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:11:00", "port": 1 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:12:00", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:22:00", "port": 3 } }
+            # { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.11.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_A } },
+            # { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.12.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_B } }
         ]
     },
     "s22": {
@@ -87,11 +92,35 @@ SWITCH_CONFIGS = {
         "bmv2_json": TAG_BMV2_JSON,
         "table_entries": [
             { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:03:00", "port": 1 } },
-            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:04:00", "port": 2 } }
-            { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.13.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_C } }
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:13:00", "port": 1 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:21:00", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:21:00", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:23:00", "port": 3 } }
+            # { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.13.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_C } }
         ]
     },
+    "s23": {
+        "p4info": TAG_P4INFO_FILE,
+        "bmv2_json": TAG_BMV2_JSON,
+        "table_entries": [
+            { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.13.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:13:00", "port": 1 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.11.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:22:00", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.12.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:22:00", "port": 2 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:24:00", "port": 3 } }
+            # { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.13.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_C } }
+        ]
+    },
+    "s24": {
+        "p4info": TAG_P4INFO_FILE,
+        "bmv2_json": TAG_BMV2_JSON,
+        "table_entries": [
+            { "table": "MyIngress.ipv4_lpm", "default_action": True, "action_name": "MyIngress.drop", "action_params": {} },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.14.0", 24] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:14:00", "port": 1 } },
+            { "table": "MyIngress.ipv4_lpm", "match": { "hdr.ipv4.dstAddr": ["192.168.0.0", 16] }, "action_name": "MyIngress.ipv4_forward", "action_params": { "dstAddr": "08:00:00:00:23:00", "port": 2 } }
+            # { "table": "MyEgress.set_dscp_tag", "match": { "hdr.ipv4.srcAddr": ["192.168.14.0", 24] }, "action_name": "MyEgress.modify_dscp", "action_params": { "dscp_value": DSCP_D } }
+        ]
+    }
     # optionally add others...
 }
 

@@ -2,7 +2,6 @@
 BMV2_SWITCH_EXE = simple_switch_grpc
 TOPO = ex-topo/topology.json
 
-# SPDX-License-Identifier: Apache-2.0
 BUILD_DIR = build
 PCAP_DIR = pcaps
 LOG_DIR = logs

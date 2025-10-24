@@ -1,51 +1,264 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
+"""
+controller.py - config-driven P4Runtime controller
+
+Reads per-switch JSON configs named "<sw_name>-config.json" from CONFIG_DIR and programs
+the switch accordingly. Falls back to hard-coded behavior when no config file exists.
+
+Usage:
+  - Put config files under ./configs/ such as configs/s11-config.json
+  - Run the script after the BMv2 switches are up:
+      python3 controller.py
+"""
 import os
 import sys
 import time
-from time import sleep
+import json
 import grpc
+from time import sleep
 
-# Import P4Runtime lib from parent utils dir (same style as tutorials)
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../utils/'))
+import psycopg2
+import psycopg2.extras
+
+
+# helper path used by the tutorials repo
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             '../../utils/'))
 import p4runtime_lib.bmv2
 import p4runtime_lib.helper
 from p4runtime_lib.error_utils import printGrpcError
 from p4runtime_lib.switch import ShutdownAllSwitchConnections
 
-"""
-controller.py
+# --- Adjust these to suit your layout ---
+CONFIG_DIR = "configs"   # per-switch JSON files live here: e.g. configs/s11-config.json
 
-Programs DSCP tagging rules on s21 and s22.
-Tag mapping:
- - 192.168.11.0/24 -> A tag -> DSCP 10
- - 192.168.12.0/24 -> B tag -> DSCP 11
- - 192.168.13.0/24 -> C tag -> DSCP 12
-"""
-
-# Switch mapping: (grpc_addr, device_id)
+# legacy defaults (kept for fallback behavior)
 TAG_SWITCH = {
-    "s21": ("127.0.0.1:50054", 3),
-    "s22": ("127.0.0.1:50055", 4)
+    "s21": ("127.0.0.1:50055", 4),
+    "s22": ("127.0.0.1:50056", 5),
+    "s23": ("127.0.0.1:50057", 6),
+    "s24": ("127.0.0.1:50058", 7)
 }
-
 FILTER_SWITCH = {
     "s11": ("127.0.0.1:50051", 0),
     "s12": ("127.0.0.1:50052", 1),
-    "s13": ("127.0.0.1:50053", 2)
+    "s13": ("127.0.0.1:50053", 2),
+    "s14": ("127.0.0.1:50054", 3)
 }
 
-DSCP_A = 10   # Class A tag
-DSCP_B = 11  # Class B tag
-DSCP_C = 12  # Class C tag
+# default p4 artifacts (used when config doesn't specify paths)
+DEFAULT_TAG_P4INFO = "build/tag.p4.p4info.txtpb"
+DEFAULT_TAG_BMV2_JSON = "build/tag.json"
+DEFAULT_FILTER_P4INFO = "build/filter.p4.p4info.txtpb"
+DEFAULT_FILTER_BMV2_JSON = "build/filter.json"
 
-TAG_P4INFO_FILE = "build/tag.p4.p4info.txtpb"
-TAG_BMV2_JSON = "build/tag.json"
+# set this if you used the other names
+DEFAULT_P4INFO = "build/basic.p4.p4info.txtpb"
+DEFAULT_BMV2_JSON = "build/basic.json"
 
-FILTER_P4INFO_FILE = "build/filter.p4.p4info.txtpb"
-FILTER_BMV2_JSON = "build/filter.json"
 
-def readTableRules(p4info_helper, sw):
+# ---------------- DB operation --------------------
+
+def get_db_conn():
+    return psycopg2.connect(host='127.0.0.1', port=5432, dbname='p4controller', user='p4', password='p4pass')
+
+def fetch_tag_rules(conn, switch_name):
+    """
+    Return list of dicts: { 'match': <dict_or_none>, 'tag_value': int, 'id': int }
+    match is the JSONB stored in tag_table (e.g. {"hdr.ipv4.srcAddr": ["192.168.11.0",24]})
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, match, tag_value FROM tag_table WHERE switch_name=%s ORDER BY id", (switch_name,))
+        rows = cur.fetchall()
+        return rows
+
+def fetch_filter_rules(conn, switch_name):
+    """
+    Return list of dicts: { 'id': int, 'tag_value': int }
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SELECT id, tag_value FROM filter_table WHERE switch_name=%s ORDER BY id", (switch_name,))
+        return cur.fetchall()
+
+
+
+# ---------------- helper utilities ----------------
+def load_switch_config(sw_name):
+    """
+    Load <CONFIG_DIR>/<sw_name>-config.json if present.
+    Returns a dict or None if not found.
+    """
+    path = os.path.join(CONFIG_DIR, f"{sw_name}-config.json")
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r') as f:
+        return json.load(f)
+
+
+def normalize_match_value(raw):
+    """
+    Normalize match value shapes to what p4runtime helper expects.
+
+    Acceptable input shapes:
+      - ["192.168.11.0", 24] -> returns ("192.168.11.0", 24)
+      - ["0x0c", 8] or [12, 8] -> returns (12, 8)
+      - "192.168.11.1" (string alone) -> returns ("192.168.11.1",)  (single-element; helper accepts)
+      - 12 (int) -> returns (12, 0)   (helper will index value[0] and value[1])
+    """
+    # if already list/tuple convert to tuple
+    if isinstance(raw, (list, tuple)):
+        if len(raw) == 1:
+            return (raw[0],)
+        return tuple(raw)
+    # if it's a string or number, coerce into a one- or two-element tuple
+    if isinstance(raw, str):
+        # single-element tuple; helper will be passed ("a.b.c.d",)
+        return (raw,)
+    if isinstance(raw, int):
+        # fallback: (value, 0) - caller should prefer two-element form for LPM
+        return (raw, 0)
+    # unknown: return as-is to trigger a helpful error downstream
+    return raw
+
+
+def build_entry_from_json(p4info_helper, entry_obj):
+    """
+    Convert a JSON description into a p4runtime table entry (using p4info_helper.buildTableEntry).
+    
+    Supported JSON fields (per entry):
+      - table (string) [required]
+      - default_action (bool) [optional]
+      - match (dict) [optional] : match field name -> value (see normalize_match_value)
+      - action_name (string) [required for non-default]
+      - action_params (dict) [optional]
+    Returns a (table_name, table_entry) tuple.
+    """
+    if 'table' not in entry_obj:
+        raise ValueError("table entry missing 'table' field")
+
+    table_name = entry_obj['table']
+
+    # default action case
+    if entry_obj.get('default_action', False):
+        action_name = entry_obj.get('action_name')
+        action_params = entry_obj.get('action_params', {}) or {}
+        entry = p4info_helper.buildTableEntry(
+            table_name=table_name,
+            default_action=True,
+            action_name=action_name,
+            action_params=action_params
+        )
+        return table_name, entry
+
+    # normal entry with match fields
+    match_fields = {}
+    if 'match' in entry_obj and isinstance(entry_obj['match'], dict):
+        for k, v in entry_obj['match'].items():
+            match_fields[k] = normalize_match_value(v)
+
+    action_name = entry_obj.get('action_name')
+    action_params = entry_obj.get('action_params', {}) or {}
+
+    table_entry = p4info_helper.buildTableEntry(
+        table_name=table_name,
+        match_fields=match_fields,
+        action_name=action_name,
+        action_params=action_params
+    )
+    return table_name, table_entry
+
+
+# ---------------- core programming functions ----------------
+def set_pipeline(sw, p4info_helper, bmv2_json_path):
+    """
+    Try to install the forwarding pipeline. If permission denied or pipeline already set,
+    warn and continue.
+    """
+    try:
+        print(f"    -> Installing pipeline (JSON: {bmv2_json_path}) on {sw.name}")
+        sw.SetForwardingPipelineConfig(
+            p4info=p4info_helper.p4info,
+            bmv2_json_file_path=bmv2_json_path)
+    except grpc.RpcError as e:
+        # tolerate already-installed pipelines
+        print(f"    ! SetForwardingPipelineConfig warning for {sw.name}: {getattr(e, 'code', lambda: '')()} {getattr(e, 'details', lambda: '')()}")
+        print("    ! Continuing (pipeline may already be installed).")
+
+
+def write_entries(sw, tbl_entries):
+    """
+    Write a list of (table_name, entry) tuples to switch sw.
+    """
+    for (tname, entry) in tbl_entries:
+        try:
+            sw.WriteTableEntry(entry)
+            print(f"    -> Inserted entry into table '{tname}' on {sw.name}")
+        except Exception as e:
+            print(f"    ! Failed to insert entry into '{tname}' on {sw.name}: {e}")
+            if isinstance(e, grpc.RpcError):
+                printGrpcError(e)
+            raise
+
+
+def program_from_config(sw_name, sw_addr, device_id):
+    """
+    Load config for sw_name and program the switch accordingly.
+    """
+    print(f"\n----- Connecting to {sw_name} @ {sw_addr} (device_id={device_id}) -----")
+    proto_dump = f"logs/{sw_name}-p4runtime.txt"
+    sw = p4runtime_lib.bmv2.Bmv2SwitchConnection(
+        name=sw_name,
+        address=sw_addr,
+        device_id=device_id,
+        proto_dump_file=proto_dump)
+
+    # acquire mastership
+    try:
+        sw.MasterArbitrationUpdate()
+    except Exception as e:
+        print(f"    ! Master arbitration/update failed for {sw_name}: {e}")
+        raise
+
+    # try to find config JSON for this switch
+    cfg = load_switch_config(sw_name)
+    # choose p4info helper and bmv2_json path from either config or defaults
+    if cfg:
+        p4info_path = cfg.get('p4info', cfg.get('p4Info', DEFAULT_P4INFO))
+        bmv2_json = cfg.get('bmv2_json', cfg.get('bmv2_json', DEFAULT_BMV2_JSON))
+        entries = cfg.get('table_entries', cfg.get('tableEntries', []))
+        p4info_helper = p4runtime_lib.helper.P4InfoHelper(p4info_path)
+
+        # install pipeline if bmv2_json is provided
+        if bmv2_json:
+            set_pipeline(sw, p4info_helper, bmv2_json)
+
+        # build table entries
+        tbl_entries = []
+        for e in entries:
+            try:
+                tname, tentry = build_entry_from_json(p4info_helper, e)
+                tbl_entries.append((tname, tentry))
+            except Exception as ex:
+                print(f"    ! Error building table entry from JSON: {ex}")
+                raise
+
+        # write entries
+        if tbl_entries:
+            print(f"    -> Writing {len(tbl_entries)} table entries to {sw_name}")
+            write_entries(sw, tbl_entries)
+        else:
+            print(f"    -> No table entries found in {sw_name}-config.json")
+    else:
+        # FALLBACK: old behavior (keeps existing logic so you can migrate)
+        print(f"    -> No config file for {sw_name}; using legacy hard-coded programming")
+        
+    # Return the switch connection to allow later ReadTableEntries
+    return sw, p4info_helper
+
+
+# Refer p4runtime/mycontroller.py
+def read_table_rules(p4info_helper, sw):
     """
     Reads the table entries from all tables on the switch.
 
@@ -71,457 +284,36 @@ def readTableRules(p4info_helper, sw):
                 print('%r' % p.value, end=' ')
             print()
 
-def forwarding_rule(p4info_helper, sw, sw_name):
-    print(f"[+] Start inserting forwarding rule to {sw_name}")
 
-    try:
-        ### Build table
-        tbl_entries = []
-        
-        if sw_name == "s11":
-            # s11 forward packet
-            tname = "MyIngress.ipv4_lpm"
-            forward_action_name = "MyIngress.ipv4_forward"
-            drop_action_name = "MyIngress.drop"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    default_action=True,
-                    action_name=drop_action_name,
-                    action_params={}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.11.1", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:01:11",
-                                   "port": 1}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.11.2", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:01:22",
-                                   "port": 2}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.0.0", 16)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:04:00",
-                                   "port": 3}
-                )
-            ))
-        
-        elif sw_name == "s12":
-            # s11 forward packet
-            tname = "MyIngress.ipv4_lpm"
-            forward_action_name = "MyIngress.ipv4_forward"
-            drop_action_name = "MyIngress.drop"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    default_action=True,
-                    action_name=drop_action_name,
-                    action_params={}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.12.1", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:02:11",
-                                   "port": 1}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.12.2", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:02:22",
-                                   "port": 2}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.0.0", 16)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:04:00",
-                                   "port": 3}
-                )
-            ))
-        
-        elif sw_name == "s13":
-            # s11 forward packet
-            tname = "MyIngress.ipv4_lpm"
-            forward_action_name = "MyIngress.ipv4_forward"
-            drop_action_name = "MyIngress.drop"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    default_action=True,
-                    action_name=drop_action_name,
-                    action_params={}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.13.1", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:03:11",
-                                   "port": 1}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.13.2", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:03:22",
-                                   "port": 2}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.13.3", 32)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:03:33",
-                                   "port": 3}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.0.0", 16)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:05:00",
-                                   "port": 4}
-                )
-            ))
-
-        elif sw_name == "s21":
-            # s21 forward packet
-            tname = "MyIngress.ipv4_lpm"
-            forward_action_name = "MyIngress.ipv4_forward"
-            drop_action_name = "MyIngress.drop"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    default_action=True,
-                    action_name=drop_action_name,
-                    action_params={}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.11.0", 24)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:01:00",
-                                   "port": 1}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.12.0", 24)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:02:00",
-                                   "port": 2}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.0.0", 16)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:05:00",
-                                   "port": 3}
-                )
-            ))
-        elif sw_name == "s22":
-            tname = "MyIngress.ipv4_lpm"
-            forward_action_name = "MyIngress.ipv4_forward"
-            drop_action_name = "MyIngress.drop"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    default_action=True,
-                    action_name=drop_action_name,
-                    action_params={}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.13.0", 24)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:03:00",
-                                   "port": 1}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.dstAddr": ("192.168.0.0", 16)},
-                    action_name=forward_action_name,
-                    action_params={"dstAddr": "08:00:00:00:04:00",
-                                   "port": 2}
-                )
-            ))
-
-        # Insert entries
-        for (tname, entry) in tbl_entries:
-            try:
-                sw.WriteTableEntry(entry)
-                print(f"    -> Inserted entry into table '{tname}' on {sw_name}")
-            except Exception as e:
-                print(f"    ! Failed to insert entry into '{tname}' on {sw_name}: {e}")
-                # optionally print gRPC details
-                if isinstance(e, grpc.RpcError):
-                    printGrpcError(e)
-                raise
-
-    except Exception as e:
-        print(f"[!] Error programming {sw_name}: {e}")
-        # try best-effort shutdown of this switch connection
-        try:
-            sw.Shutdown()
-        except Exception:
-            pass
-        raise
-
-def tagging_rule(p4info_helper, sw, sw_name):
-    print(f"[+] Start inserting tagging rule to {sw_name}")
-
-    try:
-        ### Build table
-        tbl_entries = []
-
-        if sw_name == "s21":
-            # s21: tag 11 -> DSCP_A, 12 -> DSCP_B
-            tname = "MyEgress.set_dscp_tag"
-            aname = "MyEgress.modify_dscp"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.srcAddr": ("192.168.11.0", 24)},
-                    action_name=aname,
-                    action_params={"dscp_value": DSCP_A}
-                )
-            ))
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.srcAddr": ("192.168.12.0", 24)},
-                    action_name=aname,
-                    action_params={"dscp_value": DSCP_B}
-                )
-            ))
-
-        elif sw_name == "s22":
-            # s22: tag 13 -> DSCP_C
-            tname = "MyEgress.set_dscp_tag"
-            aname = "MyEgress.modify_dscp"
-
-            tbl_entries.append((
-                tname,
-                p4info_helper.buildTableEntry(
-                    table_name=tname,
-                    match_fields={"hdr.ipv4.srcAddr": ("192.168.13.0", 24)},
-                    action_name=aname,
-                    action_params={"dscp_value": DSCP_C}
-                )
-            ))
-
-        # Insert entries
-        for (tname, entry) in tbl_entries:
-            try:
-                sw.WriteTableEntry(entry)
-                print(f"    -> Inserted entry into table '{tname}' on {sw_name}")
-            except Exception as e:
-                print(f"    ! Failed to insert entry into '{tname}' on {sw_name}: {e}")
-                # optionally print gRPC details
-                if isinstance(e, grpc.RpcError):
-                    printGrpcError(e)
-                raise
-
-    except Exception as e:
-        print(f"[!] Error programming {sw_name}: {e}")
-        # try best-effort shutdown of this switch connection
-        try:
-            sw.Shutdown()
-        except Exception:
-            pass
-        raise
-
-def filter_rule(p4info_helper, sw, sw_name):
-    print(f"[+] Start inserting filter rule to {sw_name}")
-
-    try:
-        ### Build table
-        tbl_entries = []
-
-        # if sw_name == "s11":
-        #     # s11: tag 11 -> DSCP_A, 12 -> DSCP_B
-        #     tname = "MyEgress.filter_dscp_tag"
-        #     aname = "MyEgress.drop"
-
-        #     tbl_entries.append((
-        #         tname,
-        #         p4info_helper.buildTableEntry(
-        #             table_name=tname,
-        #             match_fields={"hdr.ipv4.diffserv": (DSCP_C, 8)},
-        #             action_name=aname,
-        #             action_params={}
-        #         )
-        #     ))
-
-        # elif sw_name == "s12":
-        #     # s22: tag 13 -> DSCP_C
-        #     tname = "MyEgress.filter_dscp_tag"
-        #     aname = "MyEgress.drop"
-
-        #     tbl_entries.append((
-        #         tname,
-        #         p4info_helper.buildTableEntry(
-        #             table_name=tname,
-        #             match_fields={"hdr.ipv4.diffserv": (DSCP_C, 8)},
-        #             action_name=aname,
-        #             action_params={}
-        #         )
-        #     ))
-
-        # Insert entries
-        for (tname, entry) in tbl_entries:
-            try:
-                sw.WriteTableEntry(entry)
-                print(f"    -> Inserted entry into table '{tname}' on {sw_name}")
-            except Exception as e:
-                print(f"    ! Failed to insert entry into '{tname}' on {sw_name}: {e}")
-                # optionally print gRPC details
-                if isinstance(e, grpc.RpcError):
-                    printGrpcError(e)
-                raise
-
-    except Exception as e:
-        print(f"[!] Error programming {sw_name}: {e}")
-        # try best-effort shutdown of this switch connection
-        try:
-            sw.Shutdown()
-        except Exception:
-            pass
-        raise
-
-def install_pipeline_and_rule(p4info_helper, sw_name, sw_addr, device_id):
-    print(f"\n----- Connecting to {sw_name} @ {sw_addr} (device_id={device_id}) -----")
-    proto_dump = f"logs/{sw_name}-p4runtime.txt"
-    sw = p4runtime_lib.bmv2.Bmv2SwitchConnection(
-        name=sw_name,
-        address=sw_addr,
-        device_id=device_id,
-        proto_dump_file=proto_dump)
-
-    # try to acquire mastership
-    try:
-        sw.MasterArbitrationUpdate()
-    except Exception as e:
-        print(f"    ! Master arbitration/update failed for {sw_name}: {e}")
-        raise
-
-    ## Install pipeline
-    if sw_name in TAG_SWITCH:
-        try:
-            print(f"    -> Installing pipeline on {sw_name}")
-            sw.SetForwardingPipelineConfig(
-                p4info=p4info_helper.p4info,
-                bmv2_json_file_path=TAG_BMV2_JSON)
-        except grpc.RpcError as e:
-            # If pipeline already installed or permission issues, just warn and continue
-            print(f"    ! SetForwardingPipelineConfig warning for {sw_name}: {e.code().name} {getattr(e, 'details', lambda: '')()}")
-            print("    ! Continuing (pipeline may already be installed).")
-        
-        forwarding_rule(p4info_helper, sw, sw_name)
-        tagging_rule(p4info_helper, sw, sw_name)
-    else:
-        try:
-            print(f"    -> Installing pipeline on {sw_name}")
-            sw.SetForwardingPipelineConfig(
-                p4info=p4info_helper.p4info,
-                bmv2_json_file_path=FILTER_BMV2_JSON)
-        except grpc.RpcError as e:
-            # If pipeline already installed or permission issues, just warn and continue
-            print(f"    ! SetForwardingPipelineConfig warning for {sw_name}: {e.code().name} {getattr(e, 'details', lambda: '')()}")
-            print("    ! Continuing (pipeline may already be installed).")
-        
-        forwarding_rule(p4info_helper, sw, sw_name)
-        filter_rule(p4info_helper, sw, sw_name)
-    print(f"[+] {sw_name} programmed successfully.")
-    return sw
-
+# ---------------- main ----------------
 def main():
-    conns = []
+    all_conns = []
     try:
-        for sw_name, (addr, dev_id) in TAG_SWITCH.items():
-            #sw = tagging_rule(p4info_helper, sw_name, addr, dev_id)
-            p4info_helper = p4runtime_lib.helper.P4InfoHelper(TAG_P4INFO_FILE)
-            sw = install_pipeline_and_rule(p4info_helper, sw_name, addr, dev_id)
-            conns.append(sw)
-            readTableRules(p4info_helper, sw)
+        # assemble the list of switches to program:
+        # union of TAG_SWITCH and FILTER_SWITCH keys (you can also provide a custom list)
+        switches = {}
+        switches.update(FILTER_SWITCH)
+        switches.update(TAG_SWITCH)
         
-        for sw_name, (addr, dev_id) in FILTER_SWITCH.items():
-            #sw = tagging_rule(p4info_helper, sw_name, addr, dev_id)
-            p4info_helper = p4runtime_lib.helper.P4InfoHelper(FILTER_P4INFO_FILE)
-            sw = install_pipeline_and_rule(p4info_helper, sw_name, addr, dev_id)
-            conns.append(sw)
-            readTableRules(p4info_helper, sw)
+        for sw_name, (addr, dev_id) in switches.items():
+            try:
+                sw_conn, p4info_helper = program_from_config(sw_name, addr, dev_id)
+                all_conns.append(sw_conn)
+                # read back tables using the same p4info helper used for programming
+                read_table_rules(p4info_helper, sw_conn)
+            except Exception as e:
+                print(f"[!] Error during programming of {sw_name}: {e}")
+                # continue to the next switch (do not abort all)
+                continue
 
-        print("[+] Done programming")
+        print("[+] Done programming all switches.")
     except KeyboardInterrupt:
         print("[!] Interrupted by user")
     finally:
         print("[+] Shutting down connections (global)...")
         ShutdownAllSwitchConnections()
         print("[+] Shutdown complete.")
+
 
 if __name__ == "__main__":
     main()

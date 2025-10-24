@@ -1,4 +1,99 @@
-## v1
+## Prerequisites
+
+### Install P4 development tools
+Follow the official [P4 Tutorial Guide](https://github.com/jafingerhut/p4-guide/blob/master/bin/README-install-troubleshooting.md) to install the P4 development environment or the provided P4 VM.
+> We use the P4 VM (2025/02/01) on VirtualBox.
+
+### Install Docker
+Follow the official [Docker installation guide](https://docs.docker.com/engine/install/ubuntu/) to install the Docker Engine.
+> we use 28.5.1.
+
+Add the **p4** user to the Docker group:
+```bash
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+### Install psycopg2 for Python
+Activate the P4 virtual environment and install the PostgreSQL adapter
+```bash
+(p4dev-python-venv) $ pip install psycopg2-binary
+```
+
+## Running Steps:
+
+### Clone the project
+```bash
+cd ~/tutorials/exercises
+git clone https://github.com/DavidYu0222/p4project.git
+cd p4project
+```
+
+### Run DB container
+Start the PostgreSQL container:
+```bash
+docker compose up -d
+```
+
+Check if the tables exist:
+```bash
+docker exec -it p4-postgres psql -U p4 -d p4controller
+```
+
+Inside **psql**:
+```psql
+\dt
+```
+
+Expected output:
+```
+           List of relations
+ Schema |     Name     | Type  | Owner 
+--------+--------------+-------+-------
+ public | filter_table | table | p4
+ public | switches     | table | p4
+ public | tag_table    | table | p4
+(3 rows)
+```
+
+### Run mininet
+Start the P4 topology:
+```bash
+make run
+```
+
+If you want to modify initial flow rules, you can:
+1. Edit configuration files directly under [./configs/](./configs/)
+```bash
+vim ./configs/sx-config.json
+```
+
+2. Regenerate all config files using the script:
+```bash
+vim ./genconfigs.py
+./genconfigs.py
+```
+
+### Run controller to install flow rule
+In a new terminal:
+```bash
+./controller_db.py
+```
+
+> If an error occurs, ensure the BMv2 switch gRPC ports match those defined in your config files.
+
+### Test in Mininet
+Inside the Mininet CLI:
+```cli
+dump
+pingall
+h11 ping h41
+h11 xterm
+```
+
+## Changelog
+
+### v1
 1. In your shell, run:
    ```bash
    make run
@@ -36,15 +131,32 @@
 
 ---
 
-## v2
-The controller has been updated to read switch configurations from the [configs/](./configs/)
+### v2
+This version updates the controller to read switch configurations from JSON files under the [./configs/](./configs/)
 
 Usage:
 ```bash
 ./controller_v2.py
 ```
 
-You can modify the rules in genconfig.py, then run the script to generate configuration files for each switch:
+To modify rules, edit genconfig.py, then regenerate configuration files:
 ```bash
 ./genconfig.py
+```
+
+---
+
+### v3
+This version integrates the controller with PostgreSQL 17, running in a Docker container.
+Flow rules are now dynamically loaded from the database.
+
+Usage:
+```bash
+./controller_db.py
+```
+
+The previous version (v2) is still available:
+Usage:
+```bash
+./controller.py
 ```

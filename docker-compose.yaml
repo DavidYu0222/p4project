@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: p4-postgres
+    restart: no
+    environment:
+      POSTGRES_USER: p4
+      POSTGRES_PASSWORD: p4pass
+      POSTGRES_DB: p4controller
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./dbdata/pgdata:/var/lib/postgresql/data         # project-local DB files
+      - ./dbdata/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro   # init SQL (runs on first startup)
