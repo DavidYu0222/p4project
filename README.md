@@ -46,7 +46,7 @@ Inside **psql**:
 ```
 
 Expected output:
-```
+```bash
            List of relations
  Schema |     Name     | Type  | Owner 
 --------+--------------+-------+-------
@@ -54,6 +54,15 @@ Expected output:
  public | switches     | table | p4
  public | tag_table    | table | p4
 (3 rows)
+```
+
+Some SQL to modify table:
+```sql
+SELECT * FROM filter_table;
+
+INSERT INTO filter_table (switch_name, tag_value) VALUES ('s12', 13);
+
+DELETE FROM filter_table WHERE id = <rule_id>;
 ```
 
 ### Run mininet
@@ -79,6 +88,7 @@ In a new terminal:
 ```bash
 ./controller_db.py
 ```
+After initial setup for each switch, controller will enter monitor mode to periodically check the database every POLL_INTERVAL (default: 10 seconds) and apply any detected changes to the switches. Press Ctrl+C to leave.
 
 > If an error occurs, ensure the BMv2 switch gRPC ports match those defined in your config files.
 
@@ -159,4 +169,13 @@ The previous version (v2) is still available:
 Usage:
 ```bash
 ./controller.py
+```
+
+### v4
+This version of the controller periodically checks the database every POLL_INTERVAL (default: 10 seconds) and applies any detected changes to the switches.
+It also retrieves and displays the counters for tagged and filtered packets in the terminal.
+
+Usage:
+```bash
+./controller_db.py
 ```

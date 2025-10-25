@@ -224,9 +224,9 @@ def program_from_config(sw_name, sw_addr, device_id):
     cfg = load_switch_config(sw_name)
     # choose p4info helper and bmv2_json path from either config or defaults
     if cfg:
-        p4info_path = cfg.get('p4info', cfg.get('p4Info', DEFAULT_P4INFO))
-        bmv2_json = cfg.get('bmv2_json', cfg.get('bmv2_json', DEFAULT_BMV2_JSON))
-        entries = cfg.get('table_entries', cfg.get('tableEntries', []))
+        p4info_path = cfg.get('p4info', DEFAULT_P4INFO)
+        bmv2_json = cfg.get('bmv2_json', DEFAULT_BMV2_JSON)
+        entries = cfg.get('table_entries', [])
         p4info_helper = p4runtime_lib.helper.P4InfoHelper(p4info_path)
 
         # install pipeline if bmv2_json is provided

@@ -21,6 +21,7 @@ import time
 import json
 import grpc
 from time import sleep
+import hashlib
 
 import psycopg2
 import psycopg2.extras
@@ -33,10 +34,12 @@ import p4runtime_lib.helper
 from p4runtime_lib.error_utils import printGrpcError
 from p4runtime_lib.switch import ShutdownAllSwitchConnections
 
+from p4.v1 import p4runtime_pb2
+
 # --- Adjust these to suit your layout ---
 CONFIG_DIR = "configs"   # per-switch JSON files live here: e.g. configs/s11-config.json
+POLL_INTERVAL = 10
 
-# legacy defaults (kept for fallback behavior)
 TAG_SWITCH = {
     "s21": ("127.0.0.1:50055", 4),
     "s22": ("127.0.0.1:50056", 5),
@@ -49,12 +52,6 @@ FILTER_SWITCH = {
     "s13": ("127.0.0.1:50053", 2),
     "s14": ("127.0.0.1:50054", 3)
 }
-
-# default p4 artifacts (used when config doesn't specify paths)
-DEFAULT_TAG_P4INFO = "build/tag.p4.p4info.txtpb"
-DEFAULT_TAG_BMV2_JSON = "build/tag.json"
-DEFAULT_FILTER_P4INFO = "build/filter.p4.p4info.txtpb"
-DEFAULT_FILTER_BMV2_JSON = "build/filter.json"
 
 # set this if you used the other names
 DEFAULT_P4INFO = "build/basic.p4.p4info.txtpb"
@@ -81,8 +78,7 @@ def fetch_tag_rules(conn, switch_name):
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, match, tag_value FROM tag_table WHERE switch_name=%s ORDER BY id", (switch_name,))
-        rows = cur.fetchall()
-        return rows
+        return cur.fetchall()
 
 
 def fetch_filter_rules(conn, switch_name):
@@ -91,8 +87,29 @@ def fetch_filter_rules(conn, switch_name):
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, tag_value FROM filter_table WHERE switch_name=%s ORDER BY id", (switch_name,))
-        rows = cur.fetchall()
-        return rows
+        return cur.fetchall()
+
+
+def compute_db_hash(conn, switch_name):
+    """
+    Compute an md5 fingerprint based on tag_table and filter_table rows for the switch.
+    If DB error occurs, raises exception.
+    """
+    parts = []
+    with conn.cursor() as cur:
+        # tag_table rows
+        cur.execute("SELECT id, match::text, tag_value FROM tag_table WHERE switch_name=%s ORDER BY id", (switch_name,))
+        for r in cur.fetchall():
+            # r = (id, match_text, tag_value)
+            parts.append(f"TAG:{r[0]}:{r[1] or ''}:{r[2]}")
+
+        # filter_table rows
+        cur.execute("SELECT id, tag_value FROM filter_table WHERE switch_name=%s ORDER BY id", (switch_name,))
+        for r in cur.fetchall():
+            parts.append(f"FILT:{r[0]}:{r[1]}")
+
+    combined = "|".join(parts)
+    return hashlib.md5(combined.encode()).hexdigest()
 
 
 # ---------------- helper utilities ----------------
@@ -180,7 +197,6 @@ def set_pipeline(sw, p4info_helper, bmv2_json_path):
     except grpc.RpcError as e:
         # tolerate already-installed pipelines
         print(f"    ! SetForwardingPipelineConfig warning for {sw.name}: {getattr(e, 'code', lambda: '')()} {getattr(e, 'details', lambda: '')()}")
-        print("    ! Continuing (pipeline may already be installed).")
 
 
 def write_entries(sw, tbl_entries):
@@ -198,20 +214,60 @@ def write_entries(sw, tbl_entries):
             raise
 
 
-def program_db_rules(conn, sw_name, sw, p4info_helper):
+def delete_all_db_managed_entries(sw, p4info_helper):
+    """
+    Read all table entries from the switch and delete entries that belong to
+    MyEgress.set_dscp_tag or MyEgress.filter_dscp_tag.
+    """
+    tables_to_remove = {"MyEgress.set_dscp_tag", "MyEgress.filter_dscp_tag"}
+    print(f"    -> Deleting existing DB-managed entries on {sw.name} ...")
+    try:
+        for response in sw.ReadTableEntries():
+            for entity in response.entities:
+                entry = entity.table_entry
+                # resolve table name
+                try:
+                    table_name = p4info_helper.get_tables_name(entry.table_id)
+                except Exception:
+                    table_name = None
+                # remove entries in table
+                if table_name in tables_to_remove:
+                    try:
+                        request = p4runtime_pb2.WriteRequest()
+                        request.device_id = sw.device_id
+                        request.election_id.low = 1
+                        update = request.updates.add()
+                        update.type = p4runtime_pb2.Update.DELETE
+                        update.entity.table_entry.CopyFrom(entry)
+                        sw.client_stub.Write(request)
+                        print(f"      -> Deleted entry from {table_name} on {sw.name}")
+                    except Exception as e:
+                        print(f"      ! Failed to delete entry from {table_name} on {sw.name}: {e}")
+                        if isinstance(e, grpc.RpcError):
+                            printGrpcError(e)
+                        # continue deleting other entries
+    except Exception as e:
+        print(f"    ! Error while reading table entries from {sw.name} for deletion: {e}")
+        if isinstance(e, grpc.RpcError):
+            printGrpcError(e)
+
+
+def program_db_rules(db_conn, sw, p4info_helper):
     """
     Read tag_table and filter_table for switch sw_name and program corresponding
     rules to the switch. Install tag rules first, then filter rules.
     Tag rules use table MyEgress.set_dscp_tag with action MyEgress.modify_dscp(dscp_value).
     Filter rules use table MyEgress.filter_dscp_tag with action MyEgress.drop().
     """
-    if conn is None:
-        print(f"    -> No DB connection; skipping DB rules for {sw_name}")
+    if db_conn is None:
+        print(f"    -> No DB connection; skipping DB rules for {sw.name}")
         return
 
+    delete_all_db_managed_entries(sw, p4info_helper)
+    
     try:
         # TAG rules
-        tag_rows = fetch_tag_rules(conn, sw_name)
+        tag_rows = fetch_tag_rules(db_conn, sw.name)
         if tag_rows:
             tbl_entries = []
             for r in tag_rows:
@@ -228,16 +284,16 @@ def program_db_rules(conn, sw_name, sw, p4info_helper):
                     tname, tentry = build_entry_from_json(p4info_helper, rec)
                     tbl_entries.append((tname, tentry))
                 except Exception as ex:
-                    print(f"    ! Error building tag entry for {sw_name} row {r.get('id')}: {ex}")
+                    print(f"    ! Error building tag entry for {sw.name} row {r.get('id')}: {ex}")
                     raise
             if tbl_entries:
-                print(f"    -> Writing {len(tbl_entries)} tag entries (DB) to {sw_name}")
+                print(f"    -> Writing {len(tbl_entries)} tag entries (DB) to {sw.name}")
                 write_entries(sw, tbl_entries)
         else:
-            print(f"    -> No tag rules in DB for {sw_name}")
+            print(f"    -> No tag rules in DB for {sw.name}")
 
         # FILTER rules
-        filter_rows = fetch_filter_rules(conn, sw_name)
+        filter_rows = fetch_filter_rules(db_conn, sw.name)
         if filter_rows:
             tbl_entries = []
             for r in filter_rows:
@@ -253,16 +309,16 @@ def program_db_rules(conn, sw_name, sw, p4info_helper):
                     tname, tentry = build_entry_from_json(p4info_helper, rec)
                     tbl_entries.append((tname, tentry))
                 except Exception as ex:
-                    print(f"    ! Error building filter entry for {sw_name} row {r.get('id')}: {ex}")
+                    print(f"    ! Error building filter entry for {sw.name} row {r.get('id')}: {ex}")
                     raise
             if tbl_entries:
-                print(f"    -> Writing {len(tbl_entries)} filter entries (DB) to {sw_name}")
+                print(f"    -> Writing {len(tbl_entries)} filter entries (DB) to {sw.name}")
                 write_entries(sw, tbl_entries)
         else:
-            print(f"    -> No filter rules in DB for {sw_name}")
+            print(f"    -> No filter rules in DB for {sw.name}")
 
     except Exception as e:
-        print(f"    ! Error while programming DB rules for {sw_name}: {e}")
+        print(f"    ! Error while programming DB rules for {sw.name}: {e}")
         if isinstance(e, grpc.RpcError):
             printGrpcError(e)
         raise
@@ -292,9 +348,9 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
     cfg = load_switch_config(sw_name)
     # choose p4info helper and bmv2_json path from either config or defaults
     if cfg:
-        p4info_path = cfg.get('p4info', cfg.get('p4Info', DEFAULT_P4INFO))
-        bmv2_json = cfg.get('bmv2_json', cfg.get('bmv2_json', DEFAULT_BMV2_JSON))
-        entries = cfg.get('table_entries', cfg.get('tableEntries', []))
+        p4info_path = cfg.get('p4info', DEFAULT_P4INFO)
+        bmv2_json = cfg.get('bmv2_json', DEFAULT_BMV2_JSON)
+        entries = cfg.get('table_entries', [])
         p4info_helper = p4runtime_lib.helper.P4InfoHelper(p4info_path)
 
         # install pipeline if bmv2_json is provided
@@ -303,9 +359,9 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
 
         # build table entries (forwarding rules from config)
         tbl_entries = []
-        for e in entries:
+        for entry in entries:
             try:
-                tname, tentry = build_entry_from_json(p4info_helper, e)
+                tname, tentry = build_entry_from_json(p4info_helper, entry)
                 tbl_entries.append((tname, tentry))
             except Exception as ex:
                 print(f"    ! Error building table entry from JSON: {ex}")
@@ -319,14 +375,13 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
             print(f"    -> No table entries found in {sw_name}-config.json")
     else:
         # FALLBACK: old behavior: still need a p4info_helper for DB rules
-        print(f"    -> No config file for {sw_name}; using legacy defaults")
-        # create a default p4info helper so DB rules can be built (pipeline not installed)
-        p4info_helper = p4runtime_lib.helper.P4InfoHelper(DEFAULT_P4INFO)
+        print(f"    ! Error no config file for {sw_name} (Not Found: {sw_name}-config.json)")
+        raise
 
     # Now apply DB rules (tagging/filtering) AFTER forwarding rules are installed
     if db_conn:
         try:
-            program_db_rules(db_conn, sw_name, sw, p4info_helper)
+            program_db_rules(db_conn, sw, p4info_helper)
         except Exception as e:
             print(f"    ! Failed to program DB rules for {sw_name}: {e}")
             # continue (do not abort overall)
@@ -337,7 +392,7 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
     return sw, p4info_helper
 
 
-# Refer p4runtime/mycontroller.py
+# Refer tutorial/exercise/p4runtime/mycontroller.py
 def read_table_rules(p4info_helper, sw):
     """
     Reads the table entries from all tables on the switch.
@@ -372,9 +427,28 @@ def read_table_rules(p4info_helper, sw):
             print()
 
 
+def printCounter(p4info_helper, sw, counter_name, index):
+    """
+    Reads the specified counter at the specified index from the switch. In our
+    program, the index is the tunnel ID. If the index is 0, it will return all
+    values from the counter.
+
+    :param p4info_helper: the P4Info helper
+    :param sw:  the switch connection
+    :param counter_name: the name of the counter from the P4 program
+    :param index: the counter index (in our case, the tunnel ID)
+    """
+    for response in sw.ReadCounters(p4info_helper.get_counters_id(counter_name), index):
+        for entity in response.entities:
+            counter = entity.counter_entry
+            print("%s %s %d: %d packets" % (
+                sw.name, counter_name, index,
+                counter.data.packet_count
+            ))
+
 # ---------------- main ----------------
 def main():
-    all_conns = []
+    all_conns = {}
     db_conn = None
     try:
         # try connect to DB once
@@ -393,23 +467,75 @@ def main():
         for sw_name, (addr, dev_id) in switches.items():
             try:
                 sw_conn, p4info_helper = program_from_config(sw_name, addr, dev_id, db_conn)
-                all_conns.append(sw_conn)
-                # read back tables using the same p4info helper used for programming
+                h = compute_db_hash(db_conn, sw_name)
+                all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': h}
+                
+                # read back tables
                 read_table_rules(p4info_helper, sw_conn)
             except Exception as e:
                 print(f"[!] Error during programming of {sw_name}: {e}")
-                # continue to the next switch (do not abort all)
-                continue
+                # continue (do not abort all)
 
-        print("[+] Done programming all switches.")
+        # print("[+] Done programming all switches.")
+        print("[+] Initial programming complete. Entering watch loop (poll DB). Press Ctrl-C to stop.")
+
+        while True:
+            print(f"[+] Start Detect")
+            # ensure DB connection alive
+            if db_conn is None:
+                try:
+                    db_conn = get_db_conn()
+                    print("[+] Reconnected to DB")
+                except Exception:
+                    # still not available; skip this round
+                    time.sleep(POLL_INTERVAL)
+                    continue
+
+            # for each programmed switch, compute new fingerprint and compare
+            for sw_name, sw_info in list(all_conns.items()):
+                try:
+                    new_h = compute_db_hash(db_conn, sw_name)
+                except Exception as e:
+                    print(f"    ! Error computing fingerprint for {sw_name}: {e}")
+                    new_h = None
+
+                sw_conn = sw_info.get('sw_conn')
+                p4info_helper = sw_info.get('p4info_helper')
+                old_h = sw_info.get('hash')
+
+                if new_h != old_h:
+                    print(f"[-] Detected DB change for {sw_name} (old={old_h} new={new_h})")
+                    
+                    try:
+                        program_db_rules(db_conn, sw_conn, p4info_helper)
+                    except Exception as e:
+                        print(f"    ! Failed to program DB rules for {sw_name}: {e}")
+                        # continue (do not abort overall)
+                        continue
+                    print(f"[-] Successfully apply new rule for {sw_name}")
+                    all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': new_h}
+                else:
+                    # no change
+                    print(f"[-] No rule change for {sw_name}")
+                    pass
+
+                if sw_conn.name in TAG_SWITCH:
+                    printCounter(p4info_helper, sw_conn, "tag_counter", 0)
+                else:
+                    printCounter(p4info_helper, sw_conn, "filter_counter", 0)
+
+            print(f"[+] End Detect")
+
+                
+
+
+            time.sleep(POLL_INTERVAL)
+            
+            
     except KeyboardInterrupt:
         print("[!] Interrupted by user")
     finally:
-        if db_conn:
-            try:
-                db_conn.close()
-            except Exception:
-                pass
+        db_conn.close()
         print("[+] Shutting down connections (global)...")
         ShutdownAllSwitchConnections()
         print("[+] Shutdown complete.")

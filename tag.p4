@@ -4,6 +4,7 @@
 #include <v1model.p4>
 
 const bit<16> TYPE_IPV4 = 0x800;
+const bit<32> MAX_RULE_ID = 1 << 10;
 
 /*************************************************************************
 *********************** H E A D E R S  ***********************************
@@ -138,8 +139,12 @@ control MyIngress(inout headers hdr,
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
+
+    counter(1, CounterType.packets) tag_counter;
+    
     action modify_dscp(bit<8> dscp_value) {
         hdr.ipv4.diffserv = dscp_value;
+        tag_counter.count(0);
     }
 
     table set_dscp_tag {
