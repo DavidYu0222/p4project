@@ -90,6 +90,22 @@ In a new terminal:
 ```
 After initial setup for each switch, controller will enter monitor mode to periodically check the database every POLL_INTERVAL (default: 10 seconds) and apply any detected changes to the switches. Press Ctrl+C to leave.
 
+It also shows the rule counters fetched from the switches, for example:
+```bash
+[+] Start Detect
+   s21 tag_rule
+      1: 3 packets
+      2: 0 packets
+   s22 tag_rule
+      3: 0 packets
+   s23 tag_rule
+      4: 0 packets
+   s24 tag_rule
+      5: 3 packets
+[+] End Detect
+```
+Each entry is "<rule_id>: <packet_count> packets" for the named rule on that switch (updated every POLL_INTERVAL).
+
 > If an error occurs, ensure the BMv2 switch gRPC ports match those defined in your config files.
 
 ### Test in Mininet
@@ -179,3 +195,6 @@ Usage:
 ```bash
 ./controller_db.py
 ```
+
+### v5
+This version complete the counter display function for both tag and filter rules.

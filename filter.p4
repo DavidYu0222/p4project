@@ -138,11 +138,10 @@ control MyIngress(inout headers hdr,
 control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
-    counter(1, CounterType.packets) filter_counter;
-    
-    action drop() {
+    counter(1024, CounterType.packets) filter_rule;
+    action drop(bit<32> counter_index) {
         mark_to_drop(standard_metadata);
-        filter_counter.count(0);
+        filter_rule.count(counter_index);
     }
     table filter_dscp_tag {
         key = {

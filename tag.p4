@@ -140,11 +140,10 @@ control MyEgress(inout headers hdr,
                  inout metadata meta,
                  inout standard_metadata_t standard_metadata) {
 
-    counter(1, CounterType.packets) tag_counter;
-    
-    action modify_dscp(bit<8> dscp_value) {
+    counter(1024, CounterType.packets) tag_rule;
+    action modify_dscp(bit<8> dscp_value, bit<32> counter_index) {
         hdr.ipv4.diffserv = dscp_value;
-        tag_counter.count(0);
+        tag_rule.count(counter_index);
     }
 
     table set_dscp_tag {

@@ -22,6 +22,9 @@ build*/
 # Logs folders
 logs/
 
+# DB data folders
+dbdata/pgdata/
+
 # Vagrant
 .vagrant/
 

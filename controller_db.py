@@ -13,7 +13,8 @@ Usage:
   - Put config files under ./configs/ such as configs/s11-config.json
   - Ensure PostgreSQL (tag_table/filter_table) is reachable
   - Start BMv2 switches, then run:
-      python3 controller.py
+      ./controller_db.py
+
 """
 import os
 import sys
@@ -67,14 +68,17 @@ DB_NAME = "p4controller"
 # ---------------- DB operation --------------------
 
 def get_db_conn():
-    """Return a new psycopg2 connection (throws on error)."""
+    """
+    :return: new psycopg2 connection (throws on error).
+    """
     return psycopg2.connect(host=DB_HOST, port=DB_PORT, dbname=DB_NAME, user=DB_USER, password=DB_PASSWORD)
 
 
 def fetch_tag_rules(conn, switch_name):
     """
-    Return list of dicts: { 'id': int, 'match': <dict_or_none>, 'tag_value': int }
-    match is the JSONB stored in tag_table (e.g. {"hdr.ipv4.srcAddr": ["192.168.11.0",24]})
+    :param conn: psycopg2 connection
+    :param switch_name: the switch name
+    :return: list of dicts: { 'id': int, 'match': <dict_or_none>, 'tag_value': int }
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, match, tag_value FROM tag_table WHERE switch_name=%s ORDER BY id", (switch_name,))
@@ -83,7 +87,9 @@ def fetch_tag_rules(conn, switch_name):
 
 def fetch_filter_rules(conn, switch_name):
     """
-    Return list of dicts: { 'id': int, 'tag_value': int }
+    :param conn: psycopg2 connection
+    :param switch_name: the switch name
+    :return: list of dicts: { 'id': int, 'tag_value': int }
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute("SELECT id, tag_value FROM filter_table WHERE switch_name=%s ORDER BY id", (switch_name,))
@@ -94,6 +100,10 @@ def compute_db_hash(conn, switch_name):
     """
     Compute an md5 fingerprint based on tag_table and filter_table rows for the switch.
     If DB error occurs, raises exception.
+
+    :param conn: psycopg2 connection
+    :param switch_name: the switch name
+    :return: md5 hex digest string
     """
     parts = []
     with conn.cursor() as cur:
@@ -116,7 +126,9 @@ def compute_db_hash(conn, switch_name):
 def load_switch_config(sw_name):
     """
     Load <CONFIG_DIR>/<sw_name>-config.json if present.
-    Returns a dict or None if not found.
+
+    :param sw_name: the switch name
+    :return: dict or None
     """
     path = os.path.join(CONFIG_DIR, f"{sw_name}-config.json")
     if not os.path.exists(path):
@@ -128,6 +140,9 @@ def load_switch_config(sw_name):
 def normalize_match_value(raw):
     """
     Normalize match value shapes to what p4runtime helper expects.
+
+    :param raw: raw match value from JSON
+    :return: normalized value
     """
     if raw is None:
         return None
@@ -147,6 +162,10 @@ def normalize_match_value(raw):
 def build_entry_from_json(p4info_helper, entry_obj):
     """
     Convert a JSON description into a p4runtime table entry (using p4info_helper.buildTableEntry).
+
+    :param p4info_helper: the P4Info helper
+    :param entry_obj: JSON-like dict describing the table entry
+    :return: (table_name, table_entry)
     """
     if 'table' not in entry_obj:
         raise ValueError("table entry missing 'table' field")
@@ -184,10 +203,13 @@ def build_entry_from_json(p4info_helper, entry_obj):
 
 
 # ---------------- core programming functions ----------------
-def set_pipeline(sw, p4info_helper, bmv2_json_path):
+def set_pipeline(p4info_helper, sw, bmv2_json_path):
     """
-    Try to install the forwarding pipeline. If permission denied or pipeline already set,
-    warn and continue.
+    Try to install the pipeline on switch sw by bmv2_json_path.
+
+    :param p4info_helper: the P4Info helper
+    :param sw: the switch connection
+    :param bmv2_json_path: path to the BMv2 JSON file
     """
     try:
         print(f"    -> Installing pipeline (JSON: {bmv2_json_path}) on {sw.name}")
@@ -195,13 +217,15 @@ def set_pipeline(sw, p4info_helper, bmv2_json_path):
             p4info=p4info_helper.p4info,
             bmv2_json_file_path=bmv2_json_path)
     except grpc.RpcError as e:
-        # tolerate already-installed pipelines
         print(f"    ! SetForwardingPipelineConfig warning for {sw.name}: {getattr(e, 'code', lambda: '')()} {getattr(e, 'details', lambda: '')()}")
 
 
 def write_entries(sw, tbl_entries):
     """
     Write a list of (table_name, entry) tuples to switch sw.
+
+    :param tbl_entries: list of (table_name, entry) tuples
+    :param sw: the switch connection
     """
     for (tname, entry) in tbl_entries:
         try:
@@ -214,10 +238,13 @@ def write_entries(sw, tbl_entries):
             raise
 
 
-def delete_all_db_managed_entries(sw, p4info_helper):
+def delete_all_db_managed_entries(p4info_helper, sw):
     """
     Read all table entries from the switch and delete entries that belong to
     MyEgress.set_dscp_tag or MyEgress.filter_dscp_tag.
+
+    :param p4info_helper: the P4Info helper
+    :param sw: the switch connection
     """
     tables_to_remove = {"MyEgress.set_dscp_tag", "MyEgress.filter_dscp_tag"}
     print(f"    -> Deleting existing DB-managed entries on {sw.name} ...")
@@ -245,26 +272,34 @@ def delete_all_db_managed_entries(sw, p4info_helper):
                         print(f"      ! Failed to delete entry from {table_name} on {sw.name}: {e}")
                         if isinstance(e, grpc.RpcError):
                             printGrpcError(e)
-                        # continue deleting other entries
+
     except Exception as e:
         print(f"    ! Error while reading table entries from {sw.name} for deletion: {e}")
         if isinstance(e, grpc.RpcError):
             printGrpcError(e)
 
 
-def program_db_rules(db_conn, sw, p4info_helper):
+def program_db_rules(db_conn, p4info_helper, sw):
     """
+    Delete existing DB-managed entries on the switch.
     Read tag_table and filter_table for switch sw_name and program corresponding
-    rules to the switch. Install tag rules first, then filter rules.
+    rules to the switch.
+
     Tag rules use table MyEgress.set_dscp_tag with action MyEgress.modify_dscp(dscp_value).
     Filter rules use table MyEgress.filter_dscp_tag with action MyEgress.drop().
+
+    :param db_conn: psycopg2 connection
+    :param p4info_helper: the P4Info helper
+    :param sw: the switch connection
+    :return: list of rule IDs programmed
     """
     if db_conn is None:
         print(f"    -> No DB connection; skipping DB rules for {sw.name}")
         return
 
-    delete_all_db_managed_entries(sw, p4info_helper)
-    
+    delete_all_db_managed_entries(p4info_helper, sw)
+
+    rule_list = []
     try:
         # TAG rules
         tag_rows = fetch_tag_rules(db_conn, sw.name)
@@ -273,12 +308,14 @@ def program_db_rules(db_conn, sw, p4info_helper):
             for r in tag_rows:
                 match = r.get('match') or {}
                 tag_value = r.get('tag_value')
+                counter_index = r.get('id')
+                rule_list.append(counter_index)
                 # build a JSON-like record compatible with build_entry_from_json
                 rec = {
                     'table': 'MyEgress.set_dscp_tag',
                     'match': match,
                     'action_name': 'MyEgress.modify_dscp',
-                    'action_params': {'dscp_value': tag_value}
+                    'action_params': {'dscp_value': tag_value, 'counter_index': counter_index}
                 }
                 try:
                     tname, tentry = build_entry_from_json(p4info_helper, rec)
@@ -298,12 +335,14 @@ def program_db_rules(db_conn, sw, p4info_helper):
             tbl_entries = []
             for r in filter_rows:
                 tag_value = r.get('tag_value')
+                counter_index = r.get('id')  # use rule ID as counter index
+                rule_list.append(counter_index)
                 # match on hdr.ipv4.diffserv exact 8-bit match -> represent as [value, 8]
                 rec = {
                     'table': 'MyEgress.filter_dscp_tag',
                     'match': {'hdr.ipv4.diffserv': [tag_value, 8]},
                     'action_name': 'MyEgress.drop',
-                    'action_params': {}
+                    'action_params': {'counter_index': counter_index}
                 }
                 try:
                     tname, tentry = build_entry_from_json(p4info_helper, rec)
@@ -322,12 +361,19 @@ def program_db_rules(db_conn, sw, p4info_helper):
         if isinstance(e, grpc.RpcError):
             printGrpcError(e)
         raise
+    # return the list of rule IDs programmed
+    return rule_list
 
 
-def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
+def program_config_rules(sw_name, sw_addr, device_id):
     """
     Load config for sw_name and program the switch accordingly.
     After config-based forwarding rules are written, read DB rules (tag/filter) and program them.
+
+    :param sw_name: the switch name
+    :param sw_addr: the switch address
+    :param device_id: the device ID of switch
+    :return: (sw_connection, p4info_helper)
     """
     print(f"\n----- Connecting to {sw_name} @ {sw_addr} (device_id={device_id}) -----")
     proto_dump = f"logs/{sw_name}-p4runtime.txt"
@@ -345,19 +391,19 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
         raise
 
     # try to find config JSON for this switch
-    cfg = load_switch_config(sw_name)
-    # choose p4info helper and bmv2_json path from either config or defaults
-    if cfg:
-        p4info_path = cfg.get('p4info', DEFAULT_P4INFO)
-        bmv2_json = cfg.get('bmv2_json', DEFAULT_BMV2_JSON)
-        entries = cfg.get('table_entries', [])
+    config = load_switch_config(sw_name)
+    if config:
+        # choose p4info helper and bmv2_json path from either config or defaults
+        p4info_path = config.get('p4info', DEFAULT_P4INFO)
+        bmv2_json = config.get('bmv2_json', DEFAULT_BMV2_JSON)
         p4info_helper = p4runtime_lib.helper.P4InfoHelper(p4info_path)
 
         # install pipeline if bmv2_json is provided
         if bmv2_json:
-            set_pipeline(sw, p4info_helper, bmv2_json)
+            set_pipeline(p4info_helper, sw, bmv2_json)
 
         # build table entries (forwarding rules from config)
+        entries = config.get('table_entries', [])
         tbl_entries = []
         for entry in entries:
             try:
@@ -374,28 +420,20 @@ def program_from_config(sw_name, sw_addr, device_id, db_conn=None):
         else:
             print(f"    -> No table entries found in {sw_name}-config.json")
     else:
-        # FALLBACK: old behavior: still need a p4info_helper for DB rules
         print(f"    ! Error no config file for {sw_name} (Not Found: {sw_name}-config.json)")
         raise
 
-    # Now apply DB rules (tagging/filtering) AFTER forwarding rules are installed
-    if db_conn:
-        try:
-            program_db_rules(db_conn, sw, p4info_helper)
-        except Exception as e:
-            print(f"    ! Failed to program DB rules for {sw_name}: {e}")
-            # continue (do not abort overall)
-    else:
-        print(f"    -> No DB connection available; skipping DB-sourced tag/filter rules for {sw_name}")
-
-    # Return the switch connection and the p4info helper used
-    return sw, p4info_helper
+    # Return the the p4info helper used and switch connection
+    return p4info_helper, sw
 
 
 # Refer tutorial/exercise/p4runtime/mycontroller.py
 def read_table_rules(p4info_helper, sw):
     """
     Reads the table entries from all tables on the switch.
+
+    :param p4info_helper: the P4Info helper
+    :param sw: the switch connection
     """
     print('\n----- Reading tables rules for %s -----' % sw.name)
     for response in sw.ReadTableEntries():
@@ -427,24 +465,23 @@ def read_table_rules(p4info_helper, sw):
             print()
 
 
-def printCounter(p4info_helper, sw, counter_name, index):
+def printCounter(p4info_helper, sw, counter_name, rule_list):
     """
     Reads the specified counter at the specified index from the switch. In our
-    program, the index is the tunnel ID. If the index is 0, it will return all
-    values from the counter.
+    program, the index is the rule ID in DB.
 
     :param p4info_helper: the P4Info helper
-    :param sw:  the switch connection
+    :param sw: the switch connection
     :param counter_name: the name of the counter from the P4 program
-    :param index: the counter index (in our case, the tunnel ID)
+    :param index: the counter index (in our case, the rule ID in DB)
     """
-    for response in sw.ReadCounters(p4info_helper.get_counters_id(counter_name), index):
-        for entity in response.entities:
-            counter = entity.counter_entry
-            print("%s %s %d: %d packets" % (
-                sw.name, counter_name, index,
-                counter.data.packet_count
-            ))
+    if rule_list:
+        print("  %s %s" % (sw.name, counter_name))
+        for index in rule_list:
+            for response in sw.ReadCounters(p4info_helper.get_counters_id(counter_name), index):
+                for entity in response.entities:
+                    counter = entity.counter_entry
+                    print("    %d: %d packets" % (index, counter.data.packet_count))
 
 # ---------------- main ----------------
 def main():
@@ -466,18 +503,22 @@ def main():
 
         for sw_name, (addr, dev_id) in switches.items():
             try:
-                sw_conn, p4info_helper = program_from_config(sw_name, addr, dev_id, db_conn)
+                # install config-based rules (forwarding rules)
+                p4info_helper, sw_conn = program_config_rules(sw_name, addr, dev_id)
+                # install DB rules (tagging/filtering rules) 
+                rule_list = program_db_rules(db_conn, p4info_helper, sw_conn)
+
+                # compute initial fingerprint of DB state for this switch
                 h = compute_db_hash(db_conn, sw_name)
-                all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': h}
+                all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': h, 'rules': rule_list}
                 
                 # read back tables
                 read_table_rules(p4info_helper, sw_conn)
             except Exception as e:
                 print(f"[!] Error during programming of {sw_name}: {e}")
-                # continue (do not abort all)
+                continue
 
-        # print("[+] Done programming all switches.")
-        print("[+] Initial programming complete. Entering watch loop (poll DB). Press Ctrl-C to stop.")
+        print("----- Initial programming complete. Entering watch loop. Press Ctrl-C to stop. -----")
 
         while True:
             print(f"[+] Start Detect")
@@ -485,7 +526,7 @@ def main():
             if db_conn is None:
                 try:
                     db_conn = get_db_conn()
-                    print("[+] Reconnected to DB")
+                    print("  [+] Reconnected to DB")
                 except Exception:
                     # still not available; skip this round
                     time.sleep(POLL_INTERVAL)
@@ -502,27 +543,28 @@ def main():
                 sw_conn = sw_info.get('sw_conn')
                 p4info_helper = sw_info.get('p4info_helper')
                 old_h = sw_info.get('hash')
+                rule_list = sw_info.get('rules', [])
 
+                # compare fingerprints
                 if new_h != old_h:
-                    print(f"[-] Detected DB change for {sw_name} (old={old_h} new={new_h})")
+                    print(f"  [-] Detected DB change for {sw_name} (old={old_h} new={new_h})")
                     
                     try:
-                        program_db_rules(db_conn, sw_conn, p4info_helper)
+                        rule_list = program_db_rules(db_conn, p4info_helper, sw_conn)
                     except Exception as e:
                         print(f"    ! Failed to program DB rules for {sw_name}: {e}")
                         # continue (do not abort overall)
                         continue
-                    print(f"[-] Successfully apply new rule for {sw_name}")
-                    all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': new_h}
-                else:
-                    # no change
-                    print(f"[-] No rule change for {sw_name}")
-                    pass
+                    print(f"  [-] Successfully apply new rule for {sw_name}")
+                    all_conns[sw_name] = {'sw_conn': sw_conn, 'p4info_helper': p4info_helper, 'hash': new_h, 'rules': rule_list}
+                # else:
+                #     # no change
+                #     print(f"  [-] No rule change for {sw_name}")
 
                 if sw_conn.name in TAG_SWITCH:
-                    printCounter(p4info_helper, sw_conn, "tag_counter", 0)
+                    printCounter(p4info_helper, sw_conn, "tag_rule", rule_list)
                 else:
-                    printCounter(p4info_helper, sw_conn, "filter_counter", 0)
+                    printCounter(p4info_helper, sw_conn, "filter_rule", rule_list)
 
             print(f"[+] End Detect")
 
